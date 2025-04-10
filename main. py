@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+# Betting Bot Pro 5.0 (Telegram, ML, Risk Management)
+
+import os
+import logging
+import asyncio
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters
+)
+import lightgbm as lgb
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+import aiohttp
+import joblib
+
+# ========== CONFIG ==========
+class Config:
+    MODEL_PATH = 'ensemble_model.pkl'
+    API_URL = "https://sports-api.com/v2"
+    UPDATE_INTERVAL = 300  # 5 minutes
+    INITIAL_BANK = 10000
+    RISK_PROFILE = {
+        'base_stake': 0.03,
+        'max_loss': 0.15,
+        'cool_down': 3
+    }
+
+# ========== INITIALIZATION ==========
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+class BettingBot:
+    def __init__(self):
+        self.model = joblib.load(Config.MODEL_PATH)
+        self.bankroll = Config.INITIAL_BANK
+        self.session = aiohttp.ClientSession()
+        self.last_bets = []
+
+    async def fetch_events(self):
+        async with self.session.get(
+            f"{Config.API_URL}/live",
+            headers={"Authorization": f"Bearer {os.getenv('API_KEY')}"}
+        ) as resp:
+            return await resp.json()
+
+    def analyze_event(self, event):
+        features = self._extract_features(event)
+        prob = self.model.predict_proba([features])[0][1]
+        return {
+            'event_id': event['id'],
+            'prob': prob,
+            'odds': max(event['odds']),
+            'features': features
+        }
+
+    def _extract_features(self, event):
+        return [
+            event['home_form'] - event['away_form'],
+            event['h2h_win_rate'],
+            len(event['injuries']),
+            event['importance'],
+            datetime.now().hour / 24
+        ]
+
+    def calculate_stake(self, prob, odds):
+        kelly = (prob * odds - 1) / (odds - 1)
+        stake = self.bankroll * Config.RISK_PROFILE['base_stake'] * kelly
+        return min(stake, self.bankroll * 0.05)
+
+    async def place_bet(self, event, stake):
+        # Implementation for real API
+        return {'status': 'success', 'amount': stake}
+
+# ========== TELEGRAM INTERFACE ==========
+bot = BettingBot()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🎯 Рекомендации", callback_data='get_tips'),
+         InlineKeyboardButton("📊 Статистика", callback_data='stats')],
+        [InlineKeyboardButton("⚙ Настройки", callback_data='settings')]
+    ]
+    await update.message.reply_text(
+        "🏆 Профессиональный бот для ставок\n"
+        "Автоматические прогнозы с ИИ",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'get_tips':
+        events = await bot.fetch_events()
+        best_event = max(events, key=lambda x: x['prob'])
+        stake = bot.calculate_stake(best_event['prob'], best_event['odds'])
+        await query.edit_message_text(
+            f"🔥 Лучшая ставка:\n"
+            f"{best_event['teams']}\n"
+            f"Вероятность: {best_event['prob']*100:.1f}%\n"
+            f"Ставка: ${stake:.2f}")
+
+async def main():
+    app = Application.builder().token(os.getenv('TELEGRAM_TOKEN')).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_query))
+    
+    await app.initialize()
+    await app.start()
+    await asyncio.sleep(5)
+    
+    while True:
+        await asyncio.sleep(Config.UPDATE_INTERVAL)
+        events = await bot.fetch_events()
+        for event in events:
+            analysis = bot.analyze_event(event)
+            if analysis['prob'] > 0.65:
+                stake = bot.calculate_stake(analysis['prob'], analysis['odds'])
+                await bot.place_bet(event, stake)
+
+if __name__ == "__main__":
+    asyncio.run(main())
